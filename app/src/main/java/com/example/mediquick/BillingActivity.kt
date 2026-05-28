@@ -9,23 +9,37 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.google.firebase.auth.FirebaseAuth
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 
 class BillingActivity : AppCompatActivity() {
 
-    private lateinit var db: DatabaseHelper
+    private lateinit var db: AppDatabase
+    private lateinit var saleRepository: SaleRepository
+    private lateinit var medicineRepository: MedicineRepository
     private val medicines = mutableListOf<Medicine>()
     private val cart = mutableListOf<CartItem>()
     private lateinit var medAdapter: MedicineAdapter
     private lateinit var cartAdapter: CartAdapter
+    private var currentUser: User? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_billing)
-        db = DatabaseHelper(this)
+        db = AppDatabase.getDatabase(this)
+        saleRepository = SaleRepository(db.saleDao())
+        medicineRepository = MedicineRepository(db.medicineDao())
 
         findViewById<ImageView>(R.id.ivBack).setOnClickListener { finish() }
+
+        lifecycleScope.launch {
+            val uid = FirebaseAuth.getInstance().currentUser?.uid ?: "ADMIN_ID"
+            currentUser = db.userDao().getUserById(uid)
+        }
 
         val rvMeds = findViewById<RecyclerView>(R.id.rvMedicines)
         medAdapter = MedicineAdapter(medicines, onEdit = null, onDelete = null, onAddCart = { med -> addToCart(med) })
@@ -54,9 +68,13 @@ class BillingActivity : AppCompatActivity() {
 
     private fun loadMedicines() {
         val q = findViewById<EditText>(R.id.etSearch).text.toString()
-        val list = db.getAllMedicines(q)
-        medicines.clear(); medicines.addAll(list)
-        medAdapter.notifyDataSetChanged()
+        lifecycleScope.launch {
+            db.medicineDao().searchMedicinesWithCategory(q, "All").collectLatest { list ->
+                medicines.clear()
+                medicines.addAll(list)
+                medAdapter.notifyDataSetChanged()
+            }
+        }
     }
 
     private fun addToCart(med: Medicine) {
@@ -97,68 +115,41 @@ class BillingActivity : AppCompatActivity() {
         if (cart.isEmpty()) return
         val total = cart.sumOf { it.subtotal }
         val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
-        val customer = findViewById<EditText>(R.id.etCustomer).text.toString().trim()
-            .ifEmpty { "Walk-in Customer" }
-        val sale = Sale(customerName = customer, date = sdf.format(java.util.Date()), total = total)
-        val saleId = db.insertSale(sale, cart)
 
-        startActivity(
-            Intent(this, ReceiptActivity::class.java)
-                .putExtra("sale_id", saleId)
-        )
-        cart.clear()
-        cartAdapter.notifyDataSetChanged()
-        updateTotal()
-        loadMedicines()
-    }
-}
+        val user = currentUser
+        val uid = user?.uid ?: "GUEST"
+        val customerName = findViewById<EditText>(R.id.etCustomer).text.toString().trim()
+            .ifEmpty { user?.name ?: "Walk-in Customer" }
 
+        val status = if (user?.role == UserRole.USER) "PAYMENT_PENDING" else "COMPLETED"
 
-class CartAdapter(
-    private val items: MutableList<CartItem>,
-    private val onRemove: (Int) -> Unit,
-    private val onQuantityChanged: () -> Unit
-) : RecyclerView.Adapter<CartAdapter.VH>() {
+        lifecycleScope.launch {
+            val sale = Sale(
+                customerName = customerName,
+                customerId = uid,
+                date = sdf.format(java.util.Date()),
+                total = total,
+                status = status,
+                pharmacistId = if (user?.role == UserRole.PHARMACIST) uid else null
+            )
 
-    inner class VH(v: View) : RecyclerView.ViewHolder(v) {
-        val tvName    : TextView    = v.findViewById(R.id.tvCartName)
-        val tvQty     : TextView    = v.findViewById(R.id.tvCartQty)
-        val tvSubtotal: TextView    = v.findViewById(R.id.tvCartSubtotal)
-        val btnMinus  : ImageButton = v.findViewById(R.id.btnMinus)
-        val btnPlus   : ImageButton = v.findViewById(R.id.btnPlus)
-        val btnRemove : ImageButton = v.findViewById(R.id.btnRemove)
-    }
+            // Uses SaleRepository — saves to both Room AND Firestore
+            val saleId = saleRepository.insertSaleWithItems(sale, cart)
 
-    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH =
-        VH(LayoutInflater.from(parent.context).inflate(R.layout.item_cart, parent, false))
+            // Update stock via repository so Firestore stock count stays in sync too
+            for (item in cart) {
+                val updatedMed = item.medicine.copy(stock = item.medicine.stock - item.quantity)
+                medicineRepository.update(updatedMed)
+            }
 
-    override fun getItemCount() = items.size
-
-    override fun onBindViewHolder(h: VH, pos: Int) {
-        val item = items[pos]
-        val fmt = java.text.DecimalFormat("#,##0.00")
-        h.tvName.text     = item.medicine.name
-        h.tvQty.text      = item.quantity.toString()
-        h.tvSubtotal.text = "Rs ${fmt.format(item.subtotal)}"
-
-        h.btnMinus.setOnClickListener {
-            if (item.quantity > 1) {
-                item.quantity--
-                notifyItemChanged(pos)
-                onQuantityChanged()
-            } else {
-                onRemove(pos)
+            runOnUiThread {
+                Toast.makeText(this@BillingActivity, "Order placed successfully!", Toast.LENGTH_SHORT).show()
+                startActivity(
+                    Intent(this@BillingActivity, ReceiptActivity::class.java)
+                        .putExtra("sale_id", saleId)
+                )
+                finish()
             }
         }
-        h.btnPlus.setOnClickListener {
-            if (item.quantity < item.medicine.stock) {
-                item.quantity++
-                notifyItemChanged(pos)
-                onQuantityChanged()
-            } else {
-                Toast.makeText(h.itemView.context, "Max stock reached", Toast.LENGTH_SHORT).show()
-            }
-        }
-        h.btnRemove.setOnClickListener { onRemove(pos) }
     }
 }
